@@ -1,16 +1,45 @@
-from models_fusion import *
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from loss import *
-from Dataloader_1 import *
-from tqdm import tqdm
-import visdom
 import time
-import torch
-import numpy as np
-import torch.nn as nn
-from torch.nn import functional as F
-from Retrieval1 import DoRetrieval5, DoRetrieval_cifar3, save_mat
 
+import numpy as np
+import torch
+import torch.nn as nn
+import visdom
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from tqdm import tqdm
+
+from Dataloader import *
+from Retrieval import *
+from loss import *
+from models_fusion import *
+import sys
+import time
+import os
+from datetime import datetime
+
+
+torch.random.manual_seed(seed=42)
+np.random.seed(42)  # Python的随机性
+os.environ['PYTHONHASHSEED'] = str(42)  # 设置Python哈希种子，为了禁止hash随机化，使得实验可复现
+np.random.seed(42)  # numpy的随机性
+torch.manual_seed(42)  # torch的CPU随机性，为CPU设置随机种子
+torch.cuda.manual_seed(42)  # torch的GPU随机性，为当前GPU设置随机种子
+torch.backends.cudnn.benchmark = False  # if benchmark=True, deterministic will be False
+torch.backends.cudnn.deterministic = True  # 选择确定性算法
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.matmul.allow_tf32 = True
+
+
+class Logger(object):
+    def __init__(self, filename="Default.log", stream=sys.stdout):
+        self.terminal = stream
+        self.log = open(filename, "a")
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
 
 
 class Visualizer(object):
@@ -27,10 +56,10 @@ class Visualizer(object):
         self.index = {}
         self.log_text = ''
         self.env = env
-    
+
     def save(self):
         self.vis.save([self.env])
- 
+
     def reinit(self, env='default', **kwargs):
         """
         修改visdom的配置
@@ -92,12 +121,12 @@ class Visualizer(object):
 def get_args_parser():
     parser = argparse.ArgumentParser('DHD', add_help=False)
 
-    parser.add_argument('--gpu_id', default="1", type=str, help="""Define GPU id.""")
-    parser.add_argument('--data_dir', default="/data", type=str, help="""Path to dataset.""")
-    parser.add_argument('--dataset', default="cifar-10", type=str, help="""Dataset name: imagenet, nuswide_m, coco.""")
+    parser.add_argument('--gpu_id', default="0", type=str, help="""Define GPU id.""")
+    parser.add_argument('--data_dir', default="data", type=str, help="""Path to dataset.""")
+    parser.add_argument('--dataset', default="imagenet", type=str, help="""Dataset name: cifar, imagenet, nuswide_m, coco.""")
     parser.add_argument('--accumulation_steps', default=4, type=int, help="""accumulation_steps""")
     parser.add_argument('--batch_size', default=64, type=int, help="""Training mini-batch size.""")
-    parser.add_argument('--num_workers', default=16, type=int, help="""Number of data loading workers per GPU.""")
+    parser.add_argument('--num_workers', default=32, type=int, help="""Number of data loading workers per GPU.""")
     parser.add_argument('--encoder', default="SwinT", type=str, help="""Encoder network: ResNet, AlexNet, ViT, DeiT, SwinT.""")
     parser.add_argument('--N_bits', default='16, 32, 64', type=str, help="""Number of bits to retrieval.""")
     parser.add_argument('--init_lr', default=3e-4, type=float, help="""Initial learning rate.""")
@@ -132,7 +161,7 @@ class HashingEncoder(nn.Module):
 
     def forward(self, x):
         return torch.tanh(self.Hash(x))
-    
+
 class PnetEncoder(nn.Module):
     def __init__(self, org_dim, k_bits):
         super().__init__()
@@ -166,17 +195,27 @@ class Hash_func(nn.Module):
         return self.bits_list, self.P
 
 def train(args):
+    # Setup logging
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = os.path.join("logs", args.dataset)
+    os.makedirs(log_dir, exist_ok=True)
+    log_filename = os.path.join(log_dir, f"{args.dataset}_{timestamp}.log")
+    sys.stdout = Logger(log_filename, sys.stdout)
+    sys.stderr = Logger(log_filename, sys.stderr)
+    
+    print(f"Logging to {log_filename}")
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+    mem = 1
     device = T.device('cuda')
     # visualization
     vis_env = 'main'
-    vis_port = 8888  # visdom port
+    vis_port = 8097  # visdom port
     flag = args.dataset
     sk_bits_list = list(map(int, args.N_bits.split(",")))  # str -> list
 
     vis_env = '{}_{}_full_{}'.format(flag, args.N_bits,
-                                     'test23_5_2_4_5_pl2_{}_batch{}_l1{}_l2{}_xiuzheng4_savemodel'.format(args.init_lr, args.batch_size, args.lambda1, args.lambda2))
-    vis = Visualizer(vis_env, port=vis_port, server="http://10.109.119.102")
+                                     'FMTH_{}_batch{}_{}_{}'.format(args.init_lr, args.batch_size, args.lambda1, args.lambda2))
+    vis = Visualizer(vis_env, port=vis_port, server="http://127.0.0.1")
 
     path = args.data_dir
     dname = args.dataset
@@ -187,34 +226,44 @@ def train(args):
     init_lr = args.init_lr
     batch_size = args.batch_size
 
-
-    if dname=='imagenet':
+    if 'imagenet' in dname:
         NB_CLS=100
         Top_N=1000
-        
-    elif dname=='nuswide':
+    elif 'nuswide' in dname:
         NB_CLS=21
         Top_N=5000
-    elif dname=='nuswide_m':
-        NB_CLS=21
-        Top_N=5000
-    elif dname=='coco':
+    elif 'coco' in dname:
         NB_CLS=80
         Top_N=5000
-    elif dname=='cifar-10':
+    elif 'cifar' in dname:
         NB_CLS=10
         Top_N=54000
     else:
         print("Wrong dataset name.")
         return
+    
+    if not mem:
+        if 'cifar' not in dname:
+            if 'imagenet' in dname:
+                Img_dir = "/root/datasets/imagenet/image"
+            if 'coco' in dname:
+                Img_dir = "/root/datasets/coco/coco256"
+            if 'nuswide' in dname:
+                Img_dir = "/root/datasets/nuswide/nuswide256"
+    else:
+        if 'cifar' not in dname:
+            if 'imagenet' in dname:
+                Img_dir = "/root/ImageNet/image"
+            if 'coco' in dname:
+                Img_dir = "/root/coco256"
+            if 'nuswide' in dname:
+                Img_dir = "/root/nuswide256"
 
-    if dname != 'cifar-10':
-        Img_dir = '/home/admin/code/Hash/VTS/VisionTransformerHashing-main/datasets/'+dname+'/'+dname+'256'
-        Train_dir = '/home/admin/code/Hash/VTS/VisionTransformerHashing-main/datasets/'+dname+'/'+dname+'_Train.txt'
-        Gallery_dir = '/home/admin/code/Hash/VTS/VisionTransformerHashing-main/datasets/'+dname+'/'+dname+'_DB.txt'
-        Query_dir = '/home/admin/code/Hash/VTS/VisionTransformerHashing-main/datasets/'+dname+'/'+dname+'_Query.txt'
+    Train_dir = 'data/'+dname+'/'+dname+'_Train.txt'
+    Gallery_dir = 'data/'+dname+'/'+dname+'_DB.txt'
+    Query_dir = 'data/'+dname+'/'+dname+'_Query.txt'
 
-    if dname != 'cifar-10':
+    if 'cifar' not in dname:
         org_size = 256
         input_size = 224
     else:
@@ -223,17 +272,22 @@ def train(args):
 
     AugT = Augmentation(org_size, args.transformation_scale)
 
-    if dname != 'cifar-10':
+    if 'cifar' not in dname:
         Crop = nn.Sequential(Kg.CenterCrop(input_size))
     else:
         Crop = nn.Sequential(nn.Identity())
 
     Norm = nn.Sequential(Kg.Normalize(mean=T.as_tensor([0.485, 0.456, 0.406]), std=T.as_tensor([0.229, 0.224, 0.225])))
 
-    if dname != 'cifar-10':
-        trainset = Loader(Img_dir, Train_dir, NB_CLS)
-        trainloader = T.utils.data.DataLoader(trainset, batch_size=batch_size, drop_last=True,
-                                                shuffle=True, num_workers=args.num_workers)
+    if 'cifar' not in dname:
+        if "coco" in dname or 'nuswide'in dname:
+            trainset = Loader(Img_dir, Train_dir, NB_CLS)
+            trainloader = T.utils.data.DataLoader(trainset, batch_size=batch_size, drop_last=True,
+                                                    shuffle=True, num_workers=args.num_workers)
+        else:
+            trainset = Loader_imagenet(Img_dir, Train_dir, NB_CLS)
+            trainloader = T.utils.data.DataLoader(trainset, batch_size=batch_size, drop_last=True,
+                                                  shuffle=True, num_workers=args.num_workers)
     else:
          trainloader, testloader, databaseloader = cifar_dataset(batch_size=batch_size, num_workers=args.num_workers)
 
@@ -257,7 +311,7 @@ def train(args):
         return
 
     H = Hash_func(fc_dim, sk_bits_list, NB_CLS)
-    
+
     Baseline.cuda(device)
     H.cuda(device)
 
@@ -285,7 +339,7 @@ def train(args):
     for epoch in range(args.max_epoch):  # loop over the dataset multiple times
         print('Epoch:', epoch, 'LR:', optimizer.param_groups[0]['lr'], optimizer.param_groups[1]['lr'])
         C_loss = 0.0 #哈希代理损失
-        S_loss = 0.0 
+        S_loss = 0.0
         R_loss = 0.0 #量化损失
 
         for i, data in tqdm(enumerate(trainloader)):
@@ -320,7 +374,13 @@ def train(args):
 
         save__dir = "./data"
         if True:  # and (epoch+1) >= args.eval_init:
-            mAPs, query_c, gallery_c, query_y, gallery_y = DoRetrieval_cifar3(device, Baseline.eval(), H.eval(), Y, databaseloader, testloader, NB_CLS, Top_N, args)
+            if "cifar" in dname:
+                mAPs, query_c, gallery_c, query_y, gallery_y = DoRetrieval_cifar(device, Baseline.eval(), H.eval(), Y, databaseloader, testloader, NB_CLS, Top_N, args)
+            if "coco" in dname or "nuswide" in dname:
+                 mAPs, query_c, gallery_c, query_y, gallery_y = DoRetrieval(device, Baseline.eval(), H.eval(), Y, Img_dir, Gallery_dir, Query_dir, NB_CLS, Top_N, args)
+            if "imagenet" in dname:
+                mAPs, query_c, gallery_c, query_y, gallery_y = DoRetrieval_imagenet(device, Baseline.eval(), H.eval(), Y, Img_dir, Gallery_dir, Query_dir, NB_CLS, Top_N, args)
+
             for one in sk_bits_list:
                 if mAPs[str(one)] > MAX_mAP[str(one)]:
                     MAX_mAP[str(one)] = mAPs[str(one)]
@@ -331,7 +391,7 @@ def train(args):
                         'base_model': Baseline.state_dict(),
                         'hash_model': H.state_dict(),
                         }
-                    dir_name = 'data/' + str(args.dataset) + '/' + 'models/' + str(one) + 'bit_' + str(epoch) + 'e_' + str("{:.4g}".format(MAX_mAP[str(one)])) + '.pth'
+                    dir_name = 'data/' + str(args.dataset) + '/' + 'models/' + str(one) + 'bit_' + 'epoch' + str(epoch) + '_' + str("{:.4g}".format(MAX_mAP[str(one)])) + '.pth'
                     torch.save(checkpoint, dir_name)
 
         if epoch >= args.warm_up:
@@ -362,8 +422,8 @@ def train(args):
             vis.plot('MAX_mAP_{}'.format(one), MAX_mAP[str(one)].item())
         vis.save()
 
-        
+
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser('DHD', parents=[get_args_parser()])
+    parser = argparse.ArgumentParser('FMTH', parents=[get_args_parser()])
     args = parser.parse_args()
     train(args)

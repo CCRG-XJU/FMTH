@@ -1,15 +1,9 @@
-import time
 import math
 from functools import partial
 from typing import Optional, Callable
-
-import torch
-import torch.nn as nn
-from einops import rearrange
 import torch.nn.functional as F
-import torch.utils.checkpoint as checkpoint
 from einops import rearrange, repeat
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from timm.layers import DropPath, to_2tuple, trunc_normal_
 from timm.layers import get_padding, SelectAdaptivePool2d
 from modules import *
 from models_fusion import CustLayerNorm
@@ -27,12 +21,6 @@ except:
     pass
 
 DropPath.__repr__ = lambda self: f"timm.DropPath({self.drop_prob})"
-
-"""
-CNN在远程建模能力方面的局限性使它们无法有效地提取图像中的特征，而Transformers则受到其二次计算复杂性的阻碍。最近的研究表明，以Mamba为代表的状态空间模型（SSM）可以在保持线性计算复杂度的同时有效地模拟长程相互作用。
-我们介绍了一个新颖的Conv-SSM模块。Conv-SSM将卷积层的局部特征提取能力与SSM捕获长程依赖性的能力相结合。
-"""
-
 
 def flops_selective_scan_ref(B=1, L=256, D=768, N=16, with_D=True, with_Z=False, with_Group=True, with_complex=False):
     """
